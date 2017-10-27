@@ -1,15 +1,24 @@
 import socket
+import select
 import re
 
 from oshino import Agent
+
+from oshino_tcp import dynamic_load
+
+
+def print_out(msg):
+    print(msg)
 
 
 class AsyncSocketWrapper(object):
     ADDR_PATT = re.compile(r"(tcp://)?(?P<host>\w+):(?P<port>\d+)")
 
-    def __init__(self):
+    def __init__(self, chunk_size=1024):
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.setblocking(0)
+        self.chunk_size = chunk_size
+        self.connections = [self._socket]
 
     @classmethod
     def parse_addr(cls, addr):
@@ -21,6 +30,27 @@ class AsyncSocketWrapper(object):
 
     def connect(self, addr):
         return self._socket.connect(self.parse_addr(addr))
+
+    def listen(self, size=1):
+        return self._socket.listen(size)
+
+    def accept(self):
+        conn, _ = self._socket.accept()
+        self.connections.append(conn)
+
+    def recv(self):
+        return self._socket.recv(self.chunk_size)
+
+    def open_for_read(self):
+        read, write, error = select.select(self.connections,
+                                           [],
+                                           [],
+                                           0.01)
+
+        if self._socket in read:
+            self.accept()
+
+        return filter(lambda x: x != self._socket, read)
 
 
 class TCPAgent(Agent):
@@ -37,9 +67,7 @@ class TCPAgent(Agent):
     def parser(self):
         path = self._data.get("parser", None)
         if path:
-            module, fn_name = path.rsplit(".", 1)
-            fn = getattr(__import__(module), fn_name)
-            return fn
+            return dynamic_load(path)
         else:
             return None
 
@@ -54,16 +82,30 @@ class TCPAgent(Agent):
         logger = self.get_logger()
         if self.socket_active:
             try:
+                logger.trace("Waiting for connection")
+                sockets = self.socket.open_for_read()
+                logger.trace("Available connections: {0}"
+                             .format(len(sockets)))
                 logger.trace("Trying to read msg")
-                msg = None
-                logger.trace("Received msg: '{0}'".format(msg))
-                msg_obj = self._parse(msg)
-                if msg_obj:
-                    event_fn(service=self.prefix, **msg_obj)
+                for r in sockets:
+                    try:
+                        msg = r.recv(1024)
+                    except:
+                        logger.trace("Disconnect received")
+                        self.socket.connections.remove(r)
+                        r.close()
+                        continue
+
+                    logger.trace("Received msg: '{0}'".format(msg))
+                    msg_obj = self._parse(msg)
+                    if msg_obj:
+                        event_fn(service=self.prefix, **msg_obj)
+            except BlockingIOError:
+                logger.trace("Nothing interesting is happening")
             except Exception as ex:
                 logger.exception(ex)
         else:
-            logger.debug("Zmq socket is still waiting for connection")
+            logger.debug("TCP socket is still waiting for connection")
 
     def on_start(self):
         logger = self.get_logger()
@@ -77,6 +119,7 @@ class TCPAgent(Agent):
             self.socket.connect(self.connect)
             logger.info("TCP Socket connected to: {0}".format(self.connect))
             self.socket_active = True
+        self.socket.listen(1)
 
     def on_stop(self):
         self.socket.close()
